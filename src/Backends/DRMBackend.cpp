@@ -1,5 +1,6 @@
 // DRM output stuff
 
+#include "skos_policy.h"
 #include "Script/Script.h"
 
 #include <sys/types.h>
@@ -22,6 +23,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -30,12 +32,15 @@
 #include "backend.h"
 #include "color_helpers.h"
 #include "Utils/Defer.h"
+#include "Utils/Parsers.h"
+#include "Utils/String.h"
 #include "drm_include.h"
 #include "edid.h"
 #include "gamescope_shared.h"
 #include "gpuvis_trace_utils.h"
 #include "log.hpp"
 #include "main.hpp"
+#include "mode_list_file.h"
 #include "modegen.hpp"
 #include "rendervulkan.hpp"
 #include "steamcompmgr.hpp"
@@ -54,12 +59,11 @@
 
 #include "gamescope-control-protocol.h"
 
-static constexpr bool k_bUseCursorPlane = false;
-
 extern int g_nPreferredOutputWidth;
 extern int g_nPreferredOutputHeight;
 
 gamescope::ConVar<bool> cv_drm_single_plane_optimizations( "drm_single_plane_optimizations", true, "Whether or not to enable optimizations for single plane usage." );
+gamescope::ConVar<bool> cv_drm_cursor_plane( "drm_cursor_plane", false, "Scan out the cursor with the DRM cursor plane instead of forcing composition while a cursor is visible. Known driver issues on AMDGPU." );
 
 gamescope::ConVar<bool> cv_drm_debug_disable_shaper_and_3dlut( "drm_debug_disable_shaper_and_3dlut", false, "Shaper + 3DLUT chicken bit. (Force disable/DEFAULT, no logic change)" );
 gamescope::ConVar<bool> cv_drm_debug_disable_degamma_tf( "drm_debug_disable_degamma_tf", false, "Degamma chicken bit. (Forces DEGAMMA_TF to DEFAULT, does not affect other logic)" );
@@ -169,6 +173,14 @@ using namespace std::literals;
 
 struct drm_t g_DRM = {};
 
+// Flip handler thread control. Keep the thread object global so we
+// can join it during shutdown instead of detaching and risking the
+// thread still using the DRM fd while we clean up.
+static std::thread g_page_flip_handler_thread;
+static std::atomic<bool> g_page_flip_handler_thread_should_exit{false};
+
+static int g_page_flip_pipe_fds[2] = { -1, -1 };
+
 namespace gamescope
 {
 	class CDRMBackend;
@@ -215,7 +227,7 @@ namespace gamescope
 
 	static int32_t GetVblankNs(const drmModeModeInfo *mode)
 	{
-		return (mode->vsync_start - mode->vdisplay) * 1'000'000'000ll / mode->vrefresh / mode->vtotal;
+		return VerticalFrontPorchNS( mode->vdisplay, mode->vsync_start, mode->vtotal, GetModeRefresh( mode ) );
 	}
 
 	template <typename T>
@@ -263,6 +275,7 @@ namespace gamescope
 
 		static std::optional<CDRMAtomicProperty> Instantiate( const char *pszName, CDRMAtomicObject *pObject, const DRMObjectRawProperties& rawProperties );
 
+		uint32_t GetPropertyId() const { return m_uPropertyId; }
 		uint64_t GetPendingValue() const { return m_ulPendingValue; }
 		uint64_t GetCurrentValue() const { return m_ulCurrentValue; }
 		uint64_t GetInitialValue() const { return m_ulInitialValue; }
@@ -591,7 +604,7 @@ static LogScope liftoff_log_scope( "liftoff" );
 
 static std::unordered_map< std::string, std::string > pnps = {};
 
-static void drm_unset_mode( struct drm_t *drm );
+static void drm_unset_mode( struct drm_t *drm, bool force );
 static void drm_unset_connector( struct drm_t *drm );
 
 static constexpr uint32_t s_kSteamDeckLCDRates[] =
@@ -696,9 +709,15 @@ static bool get_plane_formats( struct drm_t *drm, gamescope::CDRMPlane *pPlane, 
 
 static uint32_t pick_plane_format( const struct wlr_drm_format_set *formats, uint32_t Xformat, uint32_t Aformat )
 {
+	const VkFormatFeatureFlags neededFeatures = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_SRC_BIT;
 	uint32_t result = DRM_FORMAT_INVALID;
 	for ( size_t i = 0; i < formats->len; i++ ) {
 		uint32_t fmt = formats->formats[i].format;
+
+		// Skip formats that we cannot use with the Vulkan device
+		if ( !vulkan_format_supports_features( DRMFormatToVulkan(fmt, false), neededFeatures ) )
+			continue;
+
 		if ( fmt == Xformat ) {
 			// Prefer formats without alpha channel for main plane
 			result = fmt;
@@ -712,15 +731,28 @@ static uint32_t pick_plane_format( const struct wlr_drm_format_set *formats, uin
 /* Pick a primary plane that can be connected to the chosen CRTC. */
 static gamescope::CDRMPlane *find_primary_plane(struct drm_t *drm)
 {
+	if ( !drm->pCRTC )
+		return nullptr;
+
 	for ( std::unique_ptr< gamescope::CDRMPlane > &pPlane : drm->planes )
 	{
-		// Use a plane that can be used with the current CRTC. If no CRTC is
-		// chosen yet, pick any primary plane.
-		if ( !drm->pCRTC || (pPlane->GetModePlane()->possible_crtcs & drm->pCRTC->GetCRTCMask()) )
+		if ( pPlane->GetModePlane()->possible_crtcs & drm->pCRTC->GetCRTCMask() )
 		{
 			if ( pPlane->GetProperties().type->GetCurrentValue() == DRM_PLANE_TYPE_PRIMARY )
 				return pPlane.get();
 		}
+	}
+
+	return nullptr;
+}
+
+/* Pick any primary plane, ignoring CRTC routing, to bootstrap a headless start. */
+static gamescope::CDRMPlane *find_any_primary_plane(struct drm_t *drm)
+{
+	for ( std::unique_ptr< gamescope::CDRMPlane > &pPlane : drm->planes )
+	{
+		if ( pPlane->GetProperties().type->GetCurrentValue() == DRM_PLANE_TYPE_PRIMARY )
+			return pPlane.get();
 	}
 
 	return nullptr;
@@ -749,7 +781,8 @@ static void page_flip_handler(int fd, unsigned int frame, unsigned int sec, unsi
 	DRMPresentCtx *pCtx = reinterpret_cast<DRMPresentCtx *>( data );
 
 	// Make this const when we move into CDRMBackend.
-	GetBackend()->GetCurrentConnector()->PresentationFeedback().m_uCompletedPresents = pCtx->ulPendingFlipCount;
+	if ( g_DRM.pConnector )
+		g_DRM.pConnector->PresentationFeedback().m_uCompletedPresents = pCtx->ulPendingFlipCount;
 
 	if ( !g_DRM.pCRTC )
 		return;
@@ -790,25 +823,44 @@ void flip_handler_thread_run(void)
 {
 	pthread_setname_np( pthread_self(), "gamescope-kms" );
 
-	struct pollfd pollfd = {
-		.fd = g_DRM.fd,
-		.events = POLLIN,
-	};
+	// Prepare pollfds: one for DRM fd and one for the pipe read end to
+	// detect when the write end is closed (POLLHUP) to exit.
+	struct pollfd fds[2];
+	int nfds = 0;
 
-	while ( true )
+	fds[nfds].fd = g_DRM.fd;
+	fds[nfds].events = POLLIN;
+	nfds++;
+
+	fds[nfds].fd = g_page_flip_pipe_fds[0];
+	fds[nfds].events = POLLIN;
+	nfds++;
+
+	while ( !g_page_flip_handler_thread_should_exit.load( std::memory_order_acquire ) )
 	{
-		int ret = poll( &pollfd, 1, -1 );
+		int ret = poll( fds, nfds, -1 );
 		if ( ret < 0 ) {
+			if ( errno == EINTR )
+				continue;
 			drm_log.errorf_errno( "polling for DRM events failed" );
 			break;
 		}
 
-		drmEventContext evctx = {
-			.version = 3,
-			.page_flip_handler2 = page_flip_handler,
-		};
-		drmHandleEvent(g_DRM.fd, &evctx);
+		// Check if the pipe read end got POLLHUP (write end closed) to exit.
+		if ( fds[1].revents & (POLLIN | POLLHUP) ) {
+			break;
+		}
+
+		if ( (fds[0].revents & POLLIN) ) {
+			drmEventContext evctx = {
+				.version = 3,
+				.page_flip_handler2 = page_flip_handler,
+			};
+			drmHandleEvent( g_DRM.fd, &evctx );
+		}
 	}
+
+	drm_log.debugf("page_flip_handler_thread exiting");
 }
 
 static bool refresh_state( drm_t *drm )
@@ -1032,6 +1084,210 @@ static bool get_saved_mode(const char *description, saved_mode &mode_info)
 	return false;
 }
 
+/* Same identity extraction as CDRMConnector::ParseEDID. */
+static void parse_edid_identity(const di_edid *pEdid, char (&szMakePNP)[4], char (&szModel)[16])
+{
+	memset(szMakePNP, 0, sizeof(szMakePNP));
+	memset(szModel, 0, sizeof(szModel));
+
+	const di_edid_vendor_product *pProduct = di_edid_get_vendor_product(pEdid);
+	memcpy(szMakePNP, pProduct->manufacturer, 3);
+
+	const di_edid_display_descriptor *const *pDescriptors = di_edid_get_display_descriptors(pEdid);
+	for (size_t i = 0; pDescriptors[i] != nullptr; i++)
+	{
+		if (di_edid_display_descriptor_get_tag(pDescriptors[i]) == DI_EDID_DISPLAY_DESCRIPTOR_PRODUCT_NAME)
+			strncpy(szModel, di_edid_display_descriptor_get_string(pDescriptors[i]), sizeof(szModel) - 1);
+	}
+}
+
+static constexpr const char *k_pszVirtualScreenName = "Virtual screen";
+
+/* Resolve a mode from the display we last drove, identified by the persisted EDID. */
+static bool get_last_display_mode(saved_mode &mode_info)
+{
+	// A mode picked while headless is saved under the virtual screen's own name.
+	if (get_saved_mode(k_pszVirtualScreenName, mode_info) && mode_info.width > 0 && mode_info.height > 0 && mode_info.refresh > 0)
+	{
+		// A pick made against an earlier display's mode list does not carry over.
+		std::vector<gamescope::BackendMode> modes = gamescope::LoadModeListFile();
+		if (modes.empty() || std::any_of(modes.begin(), modes.end(), [&](const gamescope::BackendMode &mode)
+			{
+				return mode.uWidth == (uint32_t)mode_info.width && mode.uHeight == (uint32_t)mode_info.height && mode.uRefresh == (uint32_t)mode_info.refresh;
+			}))
+		{
+			drm_log.infof("using saved mode %dx%d@%d of the virtual screen",
+				mode_info.width, mode_info.height, mode_info.refresh);
+			return true;
+		}
+	}
+
+	const char *pszPath = gamescope::GetPatchedEdidPath();
+	if (!pszPath)
+		return false;
+
+	FILE *pFile = fopen(pszPath, "rb");
+	if (!pFile)
+		return false;
+
+	uint8_t edid[4096];
+	size_t ulSize = fread(edid, 1, sizeof(edid), pFile);
+	fclose(pFile);
+	if (!ulSize)
+		return false;
+
+	di_info *pInfo = di_info_parse_edid(edid, ulSize);
+	if (!pInfo)
+		return false;
+	defer( di_info_destroy( pInfo ) );
+
+	const di_edid *pEdid = di_info_get_edid(pInfo);
+
+	char szMakePNP[4];
+	char szModel[16];
+	parse_edid_identity(pEdid, szMakePNP, szModel);
+
+	const char *pszMake = szMakePNP;
+	auto pnpIter = pnps.find(szMakePNP);
+	if (pnpIter != pnps.end())
+		pszMake = pnpIter->second.c_str();
+
+	// Matches the description format setup_best_connector saves modes under.
+	char description[256];
+	snprintf(description, sizeof(description), "%s %s", pszMake, szModel);
+
+	if (get_saved_mode(description, mode_info) && mode_info.width > 0 && mode_info.height > 0 && mode_info.refresh > 0)
+	{
+		drm_log.infof("using saved mode %dx%d@%d of last connected display '%s'",
+			mode_info.width, mode_info.height, mode_info.refresh, description);
+		return true;
+	}
+
+	const di_edid_detailed_timing_def *const *pTimings = di_edid_get_detailed_timing_defs(pEdid);
+	if (pTimings[0] && !pTimings[0]->interlaced)
+	{
+		const di_edid_detailed_timing_def *pDef = pTimings[0];
+		int64_t lTotalPixels = (int64_t)(pDef->horiz_video + pDef->horiz_blank) * (pDef->vert_video + pDef->vert_blank);
+		if (pDef->horiz_video > 0 && pDef->vert_video > 0 && lTotalPixels > 0 && pDef->pixel_clock_hz > 0)
+		{
+			mode_info.width = pDef->horiz_video;
+			mode_info.height = pDef->vert_video;
+			mode_info.refresh = (int)((pDef->pixel_clock_hz + lTotalPixels / 2) / lTotalPixels);
+			if (mode_info.refresh > 0)
+			{
+				drm_log.infof("using preferred mode %dx%d@%d of last connected display '%s'",
+					mode_info.width, mode_info.height, mode_info.refresh, description);
+				return true;
+			}
+		}
+	}
+
+	return false;
+}
+
+namespace gamescope
+{
+	// Stands in for a null current connector while headless.
+	class CDRMHeadlessConnector final : public CBaseBackendConnector
+	{
+	public:
+		virtual bool IsHeadless() const override
+		{
+			return true;
+		}
+		// The null-connector path this replaces reports id 0, so keep that instead of an auto-assigned id.
+		virtual uint64_t GetConnectorID() const override
+		{
+			return 0;
+		}
+
+		virtual GamescopeScreenType GetScreenType() const override
+		{
+			return GAMESCOPE_SCREEN_TYPE_EXTERNAL;
+		}
+		virtual GamescopePanelOrientation GetCurrentOrientation() const override
+		{
+			return GAMESCOPE_PANEL_ORIENTATION_0;
+		}
+		virtual bool SupportsHDR() const override
+		{
+			return false;
+		}
+		virtual bool IsHDRActive() const override
+		{
+			return false;
+		}
+		virtual const BackendConnectorHDRInfo &GetHDRInfo() const override
+		{
+			return m_HDRInfo;
+		}
+		virtual bool IsVRRActive() const override
+		{
+			return false;
+		}
+		virtual std::span<const BackendMode> GetModes() const override
+		{
+			return m_Modes;
+		}
+
+		virtual bool SupportsVRR() const override
+		{
+			return false;
+		}
+
+		virtual std::span<const uint8_t> GetRawEDID() const override
+		{
+			return std::span<const uint8_t>{};
+		}
+		virtual std::span<const uint32_t> GetValidDynamicRefreshRates() const override
+		{
+			return std::span<const uint32_t>{};
+		}
+
+		virtual void GetNativeColorimetry(
+			bool bHDR10,
+			displaycolorimetry_t *displayColorimetry, EOTF *displayEOTF,
+			displaycolorimetry_t *outputEncodingColorimetry, EOTF *outputEncodingEOTF ) const override
+		{
+			*displayColorimetry = displaycolorimetry_709;
+			*displayEOTF = EOTF_Gamma22;
+			*outputEncodingColorimetry = displaycolorimetry_709;
+			*outputEncodingEOTF = EOTF_Gamma22;
+		}
+
+		virtual const char *GetName() const override
+		{
+			return "Headless";
+		}
+		virtual const char *GetMake() const override
+		{
+			return "Gamescope";
+		}
+		virtual const char *GetModel() const override
+		{
+			return k_pszVirtualScreenName;
+		}
+
+		virtual int Present( const FrameInfo_t *pFrameInfo, bool bAsync ) override
+		{
+			return 0;
+		}
+
+		void RebuildModes()
+		{
+			m_Modes = LoadModeListFile();
+			if ( m_Modes.empty() )
+				m_Modes.push_back( BackendMode{ (uint32_t)g_nOutputWidth, (uint32_t)g_nOutputHeight, (uint32_t)ConvertmHzToHz( g_nOutputRefresh ) } );
+		}
+
+	private:
+		BackendConnectorHDRInfo m_HDRInfo{};
+		std::vector<BackendMode> m_Modes;
+	};
+}
+
+static gamescope::CDRMHeadlessConnector s_HeadlessConnector;
+
 static GamescopeBroadcastRGBMode_t s_ExternalBroadcastRGBMode = GAMESCOPE_BROADCAST_RGB_MODE_AUTOMATIC;
 
 static bool setup_best_connector(struct drm_t *drm, bool force, bool initial)
@@ -1081,13 +1337,17 @@ static bool setup_best_connector(struct drm_t *drm, bool force, bool initial)
 	if (best == nullptr) {
 		drm_log.infof("cannot find any connected connector!");
 		drm_unset_connector(drm);
-		drm_unset_mode(drm);
+		drm_unset_mode(drm, force);
+		s_HeadlessConnector.RebuildModes();
+
+		// Steam keys saved modes by the description, so get_last_display_mode reads this name back.
 		const struct wlserver_output_info wlserver_output_info = {
-			.description = "Virtual screen",
+			.description = k_pszVirtualScreenName,
 		};
 		wlserver_lock();
 		wlserver_set_output_info(&wlserver_output_info);
 		wlserver_unlock();
+		update_connector_display_info_wl( drm );
 		return true;
 	}
 
@@ -1149,7 +1409,10 @@ static bool setup_best_connector(struct drm_t *drm, bool force, bool initial)
 	wlserver_unlock();
 
 	if (!initial)
+	{
 		WritePatchedEdid( best->GetRawEDID(), best->GetHDRInfo(), g_bRotated );
+		WriteModeListFile( best->GetModes() );
+	}
 
 	update_connector_display_info_wl( drm );
 
@@ -1341,6 +1604,10 @@ bool init_drm(struct drm_t *drm, int width, int height, int refresh)
 	if ( !drm->pPrimaryPlane )
 		drm->pPrimaryPlane = find_primary_plane( drm );
 
+	// Headless start, there is no CRTC to route through yet.
+	if ( !drm->pPrimaryPlane )
+		drm->pPrimaryPlane = find_any_primary_plane( drm );
+
 	if ( !drm->pPrimaryPlane )
 	{
 		drm_log.errorf("Failed to find a primary plane");
@@ -1389,12 +1656,15 @@ bool init_drm(struct drm_t *drm, int width, int height, int refresh)
 	} else {
 		switch (g_nDRMFormat) {
 		case DRM_FORMAT_XRGB2101010:
+		case DRM_FORMAT_ARGB2101010:
 			g_nDRMFormatOverlay = DRM_FORMAT_ARGB2101010;
 			break;
+		case DRM_FORMAT_XBGR2101010:
 		case DRM_FORMAT_ABGR2101010:
 			g_nDRMFormatOverlay = DRM_FORMAT_ABGR2101010;
 			break;
 		case DRM_FORMAT_XRGB8888:
+		case DRM_FORMAT_ARGB8888:
 			g_nDRMFormatOverlay = DRM_FORMAT_ARGB8888;
 			break;
 		default:
@@ -1402,8 +1672,14 @@ bool init_drm(struct drm_t *drm, int width, int height, int refresh)
 		}
 	}
 
-	std::thread flip_handler_thread( flip_handler_thread_run );
-	flip_handler_thread.detach();
+	// Create a pipe to wake the flip handler poll for immediate exit.
+	// Closing the write end will cause the read end to get POLLHUP.
+	if ( pipe2( g_page_flip_pipe_fds, O_CLOEXEC ) != 0 ) {
+		drm_log.errorf_errno( "page-flip pipe creation failed" );
+		return false;
+	}
+
+	g_page_flip_handler_thread = std::thread( flip_handler_thread_run );
 
 	// Set log priority to the max, liftoff_log_scope will filter for us.
 	liftoff_log_set_priority(LIFTOFF_DEBUG);
@@ -1574,9 +1850,23 @@ void finish_drm(struct drm_t *drm)
 	drm->connectors.clear();
 
 
+	// Signal the page-flip handler thread to exit and join it so it won't be
+	// using the DRM fd while we clean it up. Closing the pipe write end
+	// causes the read end to get POLLHUP, waking the thread.
+	if ( g_page_flip_handler_thread.joinable() ) {
+		g_page_flip_handler_thread_should_exit.store( true, std::memory_order_release );
 
-	// We can't close the DRM FD here, it might still be in use by the
-	// page-flip handler thread.
+		close( g_page_flip_pipe_fds[1] );
+		g_page_flip_pipe_fds[1] = -1;
+
+		g_page_flip_handler_thread.join();
+
+		close( g_page_flip_pipe_fds[0] );
+		g_page_flip_pipe_fds[0] = -1;
+	}
+
+	wlsession_close_kms();
+	g_DRM.fd = -1;
 }
 
 gamescope::OwningRc<gamescope::IBackendFb> drm_fbid_from_dmabuf( struct drm_t *drm, struct wlr_dmabuf_attributes *dma_buf )
@@ -1665,10 +1955,6 @@ static void update_drm_effective_orientations( struct drm_t *drm, const drmModeM
 		if ( pDRMInternalConnector != drm->pConnector )
 			pInternalMode = find_mode( pDRMInternalConnector->GetModeConnector(), 0, 0, 0 );
 
-		if ( g_bUseRotationShader ) {
-			g_bEnableDRMRotationShader = true;
-		}
-
 		pDRMInternalConnector->UpdateEffectiveOrientation( pInternalMode );
 	}
 
@@ -1679,10 +1965,6 @@ static void update_drm_effective_orientations( struct drm_t *drm, const drmModeM
 		const drmModeModeInfo *pExternalMode = pMode;
 		if ( pDRMExternalConnector != drm->pConnector )
 			pExternalMode = find_mode( pDRMExternalConnector->GetModeConnector(), 0, 0, 0 );
-
-		if ( g_bUseRotationShader ) {
-			g_bEnableDRMRotationShader = false;
-		}
 
 		pDRMExternalConnector->UpdateEffectiveOrientation( pExternalMode );
 	}
@@ -1888,20 +2170,20 @@ LiftoffStateCacheEntry FrameInfoToLiftoffStateCacheEntry( struct drm_t *drm, con
 {
 	LiftoffStateCacheEntry entry{};
 
-	entry.nLayerCount = frameInfo->layerCount;
+	entry.nLayerCount = frameInfo->layers.count();
 	for ( int i = 0; i < entry.nLayerCount; i++ )
 	{
-		const uint16_t srcWidth  = frameInfo->layers[ i ].tex->width();
-		const uint16_t srcHeight = frameInfo->layers[ i ].tex->height();
+		const uint16_t srcWidth  = frameInfo->layers.get( i ).tex->width();
+		const uint16_t srcHeight = frameInfo->layers.get( i ).tex->height();
 
-		int32_t crtcX = -frameInfo->layers[ i ].offset.x;
-		int32_t crtcY = -frameInfo->layers[ i ].offset.y;
-		uint64_t crtcW = srcWidth / frameInfo->layers[ i ].scale.x;
-		uint64_t crtcH = srcHeight / frameInfo->layers[ i ].scale.y;
+		int32_t crtcX = -frameInfo->layers.get( i ).offset.x;
+		int32_t crtcY = -frameInfo->layers.get( i ).offset.y;
+		uint64_t crtcW = srcWidth / frameInfo->layers.get( i ).scale.x;
+		uint64_t crtcH = srcHeight / frameInfo->layers.get( i ).scale.y;
 
-		if (g_bRotated && !g_bEnableDRMRotationShader)
+		if (g_bRotated && g_uOutputRotation == 0)
 		{
-			int64_t imageH = frameInfo->layers[ i ].tex->contentHeight() / frameInfo->layers[ i ].scale.y;
+			int64_t imageH = frameInfo->layers.get( i ).tex->contentHeight() / frameInfo->layers.get( i ).scale.y;
 
 			const int32_t x = crtcX;
 			const uint64_t w = crtcW;
@@ -1911,15 +2193,15 @@ LiftoffStateCacheEntry FrameInfoToLiftoffStateCacheEntry( struct drm_t *drm, con
 			crtcH = w;
 		}
 
-		entry.layerState[i].zpos  = frameInfo->layers[ i ].zpos;
+		entry.layerState[i].zpos  = frameInfo->layers.get( i ).zpos;
 		entry.layerState[i].srcW  = srcWidth  << 16;
 		entry.layerState[i].srcH  = srcHeight << 16;
 		entry.layerState[i].crtcX = crtcX;
 		entry.layerState[i].crtcY = crtcY;
 		entry.layerState[i].crtcW = crtcW;
 		entry.layerState[i].crtcH = crtcH;
-		entry.layerState[i].opacity = frameInfo->layers[i].opacity * 0xffff;
-		entry.layerState[i].ycbcr = frameInfo->layers[i].isYcbcr();
+		entry.layerState[i].opacity = frameInfo->layers.get( i ).opacity * 0xffff;
+		entry.layerState[i].ycbcr = frameInfo->layers.get( i ).isYcbcr();
 		if ( entry.layerState[i].ycbcr )
 		{
 			entry.layerState[i].colorEncoding = drm_get_color_encoding( g_ForcedNV12ColorSpace );
@@ -1928,9 +2210,9 @@ LiftoffStateCacheEntry FrameInfoToLiftoffStateCacheEntry( struct drm_t *drm, con
 		}
 		else
 		{
-			entry.layerState[i].colorspace = frameInfo->layers[ i ].colorspace;
+			entry.layerState[i].colorspace = frameInfo->layers.get( i ).colorspace;
 		}
-		entry.layerState[i].eAlphaBlendingMode = frameInfo->layers[i].eAlphaBlendingMode;
+		entry.layerState[i].eAlphaBlendingMode = frameInfo->layers.get( i ).eAlphaBlendingMode;
 	}
 
 	return entry;
@@ -2208,61 +2490,6 @@ namespace gamescope
 
 	void CDRMConnector::UpdateEffectiveOrientation( const drmModeModeInfo *pMode )
 	{
-		if (g_bEnableDRMRotationShader)
-		{
-			drm_log.infof("Using rotation shader");
-			
-			// Determine the rotation angle to apply via shader
-			if (g_DesiredInternalOrientation != GAMESCOPE_PANEL_ORIENTATION_AUTO)
-			{
-				// User explicitly specified orientation
-				g_eDRMRotationShaderOrientation = g_DesiredInternalOrientation;
-				drm_log.infof("User specified orientation: %d (0=0°, 1=270°, 2=90°, 3=180°)", (int)g_eDRMRotationShaderOrientation);
-			}
-			else
-			{
-				// Auto-detect orientation
-				if ( this->GetProperties().panel_orientation )
-				{
-					switch ( this->GetProperties().panel_orientation->GetCurrentValue() )
-					{
-						case DRM_MODE_PANEL_ORIENTATION_NORMAL:
-							g_eDRMRotationShaderOrientation = GAMESCOPE_PANEL_ORIENTATION_0;
-							break;
-						case DRM_MODE_PANEL_ORIENTATION_BOTTOM_UP:
-							g_eDRMRotationShaderOrientation = GAMESCOPE_PANEL_ORIENTATION_180;
-							break;
-						case DRM_MODE_PANEL_ORIENTATION_LEFT_UP:
-							g_eDRMRotationShaderOrientation = GAMESCOPE_PANEL_ORIENTATION_90;
-							break;
-						case DRM_MODE_PANEL_ORIENTATION_RIGHT_UP:
-							g_eDRMRotationShaderOrientation = GAMESCOPE_PANEL_ORIENTATION_270;
-							break;
-						default:
-							g_eDRMRotationShaderOrientation = GAMESCOPE_PANEL_ORIENTATION_0;
-							break;
-					}
-				}
-				else if ( pMode )
-				{
-					// Auto-detect portrait mode for internal displays
-					g_eDRMRotationShaderOrientation = pMode->hdisplay < pMode->vdisplay
-						? GAMESCOPE_PANEL_ORIENTATION_270
-						: GAMESCOPE_PANEL_ORIENTATION_0;
-				}
-				else
-				{
-					g_eDRMRotationShaderOrientation = GAMESCOPE_PANEL_ORIENTATION_0;
-				}
-			}
-			
-			drm_log.infof("Rotation shader will apply %d° rotation", (int)g_eDRMRotationShaderOrientation * 90);
-			
-			// Tell DRM to use 0° (no hardware rotation), shader will handle it
-			m_ChosenOrientation = GAMESCOPE_PANEL_ORIENTATION_0;
-			return;
-		}
-        
 		if ( this->GetScreenType() == GAMESCOPE_SCREEN_TYPE_INTERNAL && g_DesiredInternalOrientation != GAMESCOPE_PANEL_ORIENTATION_AUTO )
 		{
 			m_ChosenOrientation = g_DesiredInternalOrientation;
@@ -2365,6 +2592,7 @@ namespace gamescope
 
 		bool bHasKnownColorimetry = false;
 		bool bHasKnownHDRInfo = false;
+		sol::optional<float> ofScriptMaxCLL, ofScriptMaxFALL, ofScriptMinCLL;
 
 		m_Mutable.ValidDynamicRefreshRates.clear();
 		m_Mutable.fnDynamicModeGenerator = nullptr;
@@ -2462,9 +2690,12 @@ namespace gamescope
 				{
 					m_Mutable.HDR.bExposeHDRSupport = otHDRInfo->get_or( "supported", false );
 					m_Mutable.HDR.eOutputEncodingEOTF = otHDRInfo->get_or( "eotf", EOTF_Gamma22 );
-					m_Mutable.HDR.uMaxContentLightLevel = nits_to_u16( otHDRInfo->get_or( "max_content_light_level", 400.0f ) );
-					m_Mutable.HDR.uMaxFrameAverageLuminance = nits_to_u16( otHDRInfo->get_or( "max_frame_average_luminance", 400.0f ) );
-					m_Mutable.HDR.uMinContentLightLevel = nits_to_u16_dark( otHDRInfo->get_or( "min_content_light_level", 0.1f ) );
+					m_Mutable.HDR.bContentDrivenHDR = otHDRInfo->get_or( "content_driven", false );
+					m_Mutable.HDR.bSoftwareBacklight = otHDRInfo->get_or( "software_backlight", false );
+
+					ofScriptMaxCLL = (*otHDRInfo)["max_content_light_level"].get<sol::optional<float>>();
+					ofScriptMaxFALL = (*otHDRInfo)["max_frame_average_luminance"].get<sol::optional<float>>();
+					ofScriptMinCLL = (*otHDRInfo)["min_content_light_level"].get<sol::optional<float>>();
 
 					bHasKnownHDRInfo = true;
 				}
@@ -2532,7 +2763,7 @@ namespace gamescope
 		/////////////////////
 		// Parse HDR stuff.
 		/////////////////////
-		if ( !bHasKnownHDRInfo )
+		if ( !bHasKnownHDRInfo || !ofScriptMaxCLL || !ofScriptMaxFALL || !ofScriptMinCLL )
 		{
 			const di_cta_hdr_static_metadata_block *pHDRStaticMetadata = nullptr;
 			const di_cta_colorimetry_block *pColorimetry = nullptr;
@@ -2567,14 +2798,15 @@ namespace gamescope
 			if ( pColorimetry && pColorimetry->bt2020_rgb &&
 				 pHDRStaticMetadata && pHDRStaticMetadata->eotfs && pHDRStaticMetadata->eotfs->pq )
 			{
-				m_Mutable.HDR.bExposeHDRSupport = true;
-				if (disableInternalPq && GetScreenType() == GAMESCOPE_SCREEN_TYPE_INTERNAL)
-					// Current handheld internal displays have issues
-					// with PQ, e.g., Ayaneo 3, Steam Deck etc.
-					// Use Gamma 2.2 as the safest option for now.
-					m_Mutable.HDR.eOutputEncodingEOTF = EOTF_Gamma22;
-				else
-					m_Mutable.HDR.eOutputEncodingEOTF = EOTF_PQ;
+				if ( !bHasKnownHDRInfo )
+				{
+					m_Mutable.HDR.bExposeHDRSupport = true;
+					// Unknown handheld panels can advertise PQ but need Gamma 2.2.
+					// Explicit known-display profiles remain authoritative above.
+					m_Mutable.HDR.eOutputEncodingEOTF =
+						GetScreenType() == GAMESCOPE_SCREEN_TYPE_INTERNAL && !g_bEnableInternalPq
+							? EOTF_Gamma22 : EOTF_PQ;
+				}
 				m_Mutable.HDR.uMaxContentLightLevel =
 					pHDRStaticMetadata->desired_content_max_luminance
 					? nits_to_u16( pHDRStaticMetadata->desired_content_max_luminance )
@@ -2588,11 +2820,19 @@ namespace gamescope
 					? nits_to_u16_dark( pHDRStaticMetadata->desired_content_min_luminance )
 					: nits_to_u16_dark( 0.0f );
 			}
-			else
+			else if ( !bHasKnownHDRInfo )
 			{
 				m_Mutable.HDR.bExposeHDRSupport = false;
 			}
 		}
+
+		// Script values win over the EDID field by field.
+		if ( ofScriptMaxCLL )
+			m_Mutable.HDR.uMaxContentLightLevel = nits_to_u16( *ofScriptMaxCLL );
+		if ( ofScriptMaxFALL )
+			m_Mutable.HDR.uMaxFrameAverageLuminance = nits_to_u16( *ofScriptMaxFALL );
+		if ( ofScriptMinCLL )
+			m_Mutable.HDR.uMinContentLightLevel = nits_to_u16_dark( *ofScriptMinCLL );
 
 		// Generate a default HDR10 infoframe.
 		if ( m_Mutable.HDR.IsHDR10() )
@@ -2658,13 +2898,13 @@ drm_prepare_liftoff( struct drm_t *drm, const struct FrameInfo_t *frameInfo, boo
 			return -EINVAL;
 	}
 
-	bool bSinglePlane = frameInfo->layerCount < 2 && cv_drm_single_plane_optimizations;
+	bool bSinglePlane = frameInfo->layers.count() < 2 && cv_drm_single_plane_optimizations;
 
 	for ( int i = 0; i < k_nMaxLayers; i++ )
 	{
-		if ( i < frameInfo->layerCount )
+		if ( i < frameInfo->layers.count() )
 		{
-			const FrameInfo_t::Layer_t *pLayer = &frameInfo->layers[ i ];
+			const FrameInfo_t::Layer_t *pLayer = &frameInfo->layers.get( i );
 			gamescope::CDRMFb *pDrmFb = static_cast<gamescope::CDRMFb *>( (pLayer->tex && pLayer->tex->GetBackendFb()) ? pLayer->tex->GetBackendFb()->EnsureImported() : nullptr );
 
 			if ( pDrmFb == nullptr )
@@ -2681,11 +2921,11 @@ drm_prepare_liftoff( struct drm_t *drm, const struct FrameInfo_t *frameInfo, boo
 			drm->m_FbIdsInRequest.emplace_back( pDrmFb );
 
 			liftoff_layer_set_property( drm->lo_layers[ i ], "zpos", entry.layerState[i].zpos );
-			liftoff_layer_set_property( drm->lo_layers[ i ], "alpha", frameInfo->layers[ i ].opacity * 0xffff);
+			liftoff_layer_set_property( drm->lo_layers[ i ], "alpha", frameInfo->layers.get( i ).opacity * 0xffff);
 
 			if ( entry.layerState[i].zpos != g_zposBase )
 			{
-				liftoff_layer_set_property( drm->lo_layers[ i ], "pixel blend mode", (uint64_t) frameInfo->layers[i].eAlphaBlendingMode );
+				liftoff_layer_set_property( drm->lo_layers[ i ], "pixel blend mode", (uint64_t) frameInfo->layers.get( i ).eAlphaBlendingMode );
 			}
 			else
 			{
@@ -2698,7 +2938,7 @@ drm_prepare_liftoff( struct drm_t *drm, const struct FrameInfo_t *frameInfo, boo
 			liftoff_layer_set_property( drm->lo_layers[ i ], "SRC_H", entry.layerState[i].srcH );
 
 			uint64_t ulOrientation = DRM_MODE_ROTATE_0;
-			switch ( drm->pConnector->GetCurrentOrientation() )
+			switch ( g_uOutputRotation != 0 ? GAMESCOPE_PANEL_ORIENTATION_0 : drm->pConnector->GetCurrentOrientation() )
 			{
 			default:
 			case GAMESCOPE_PANEL_ORIENTATION_0:
@@ -2722,7 +2962,7 @@ drm_prepare_liftoff( struct drm_t *drm, const struct FrameInfo_t *frameInfo, boo
 			liftoff_layer_set_property( drm->lo_layers[ i ], "CRTC_W", entry.layerState[i].crtcW);
 			liftoff_layer_set_property( drm->lo_layers[ i ], "CRTC_H", entry.layerState[i].crtcH);
 
-			if ( frameInfo->layers[i].applyColorMgmt )
+			if ( frameInfo->layers.get( i ).applyColorMgmt )
 			{
 				bool bYCbCr = entry.layerState[i].ycbcr;
 
@@ -2797,17 +3037,18 @@ drm_prepare_liftoff( struct drm_t *drm, const struct FrameInfo_t *frameInfo, boo
 				}
 			}
 
-			if  ( drm_supports_srgb_to_pq( drm ) )
+			if ( drm_supports_srgb_to_pq( drm ) )
 			{
 				if (!cv_drm_debug_disable_blend_tf && !bSinglePlane)
 					liftoff_layer_set_property( drm->lo_layers[ i ], "AMD_PLANE_BLEND_TF", drm->pending.output_tf );
 				else
-					liftoff_layer_set_property( drm->lo_layers[ i ], "AMD_PLANE_BLEND_TF", AMDGPU_TRANSFER_FUNCTION_DEFAULT );	
+					liftoff_layer_set_property( drm->lo_layers[ i ], "AMD_PLANE_BLEND_TF", AMDGPU_TRANSFER_FUNCTION_DEFAULT );
 			}
+
 			if ( drm_supports_color_mgmt( drm ) )
 			{
-				if (!cv_drm_debug_disable_ctm && frameInfo->layers[i].ctm != nullptr)
-					liftoff_layer_set_property( drm->lo_layers[ i ], "AMD_PLANE_CTM", frameInfo->layers[i].ctm->GetBlobValue() );
+				if (!cv_drm_debug_disable_ctm && frameInfo->layers.get( i ).ctm != nullptr)
+					liftoff_layer_set_property( drm->lo_layers[ i ], "AMD_PLANE_CTM", frameInfo->layers.get( i ).ctm->GetBlobValue() );
 				else
 					liftoff_layer_set_property( drm->lo_layers[ i ], "AMD_PLANE_CTM", 0 );
 			}
@@ -2821,10 +3062,6 @@ drm_prepare_liftoff( struct drm_t *drm, const struct FrameInfo_t *frameInfo, boo
 			liftoff_layer_unset_property( drm->lo_layers[ i ], "COLOR_RANGE" );
 			liftoff_layer_unset_property( drm->lo_layers[ i ], "pixel blend mode" );
 
-			if ( drm_supports_srgb_to_pq( drm ) )
-			{
-				liftoff_layer_set_property( drm->lo_layers[ i ], "AMD_PLANE_BLEND_TF", AMDGPU_TRANSFER_FUNCTION_DEFAULT );
-			}
 			if ( drm_supports_color_mgmt( drm ) )
 			{
 				liftoff_layer_set_property( drm->lo_layers[ i ], "AMD_PLANE_DEGAMMA_TF", AMDGPU_TRANSFER_FUNCTION_DEFAULT );
@@ -2832,6 +3069,10 @@ drm_prepare_liftoff( struct drm_t *drm, const struct FrameInfo_t *frameInfo, boo
 				liftoff_layer_set_property( drm->lo_layers[ i ], "AMD_PLANE_SHAPER_TF", 0 );
 				liftoff_layer_set_property( drm->lo_layers[ i ], "AMD_PLANE_LUT3D", 0 );
 				liftoff_layer_set_property( drm->lo_layers[ i ], "AMD_PLANE_CTM", 0 );
+			}
+			if ( drm_supports_srgb_to_pq( drm ) )
+			{
+				liftoff_layer_set_property( drm->lo_layers[ i ], "AMD_PLANE_BLEND_TF", AMDGPU_TRANSFER_FUNCTION_DEFAULT );
 			}
 		}
 	}
@@ -2853,7 +3094,7 @@ drm_prepare_liftoff( struct drm_t *drm, const struct FrameInfo_t *frameInfo, boo
 	if ( ret == -EPERM && !attempted_in_fence_fallback && !cv_drm_debug_disable_in_fence_fd )
 	{
 		attempted_in_fence_fallback = true;
-		for ( int i = 0; i < frameInfo->layerCount; i++ )
+		for ( int i = 0; i < frameInfo->layers.count(); i++ )
 		{
 			liftoff_layer_set_property( drm->lo_layers[ i ], "IN_FENCE_FD", -1 );
 		}
@@ -2884,9 +3125,9 @@ drm_prepare_liftoff( struct drm_t *drm, const struct FrameInfo_t *frameInfo, boo
 	}
 
 	if ( ret == 0 )
-		drm_log.debugf( "can drm present %i layers", frameInfo->layerCount );
+		drm_log.debugf( "can drm present %i layers", frameInfo->layers.count() );
 	else
-		drm_log.debugf( "can NOT drm present %i layers", frameInfo->layerCount );
+		drm_log.debugf( "can NOT drm present %i layers", frameInfo->layers.count() );
 
 	return ret;
 }
@@ -2926,6 +3167,55 @@ void drm_rollback( struct drm_t *drm )
 	}
 }
 
+/* Unlinks planes a previous DRM master left on CRTCs that no longer have a mode.
+ * liftoff zeroes the CRTC_ID of every plane it isn't using, which drags the dead
+ * CRTC into our next flip and gets us "requesting event but off". */
+static void drm_unlink_foreign_planes( struct drm_t *drm )
+{
+	drmModeAtomicReq *req = drmModeAtomicAlloc();
+	bool bAnyForeign = false;
+
+	const uint32_t uOurCRTCId = drm->pCRTC ? drm->pCRTC->GetObjectId() : 0;
+	for ( std::unique_ptr< gamescope::CDRMPlane > &pPlane : drm->planes )
+	{
+		// Ask the kernel, liftoff moves planes behind our property cache.
+		drmModePlane *pKernelPlane = drmModeGetPlane( drm->fd, pPlane->GetObjectId() );
+		if ( !pKernelPlane )
+			continue;
+
+		const uint32_t uCRTCId = pKernelPlane->crtc_id;
+		drmModeFreePlane( pKernelPlane );
+
+		if ( uCRTCId == 0 || uCRTCId == uOurCRTCId )
+			continue;
+
+		// A CRTC that still has a mode is either disabled by the modeset below, or
+		// would have amdgpu reject us for taking its primary plane away.
+		drmModeCrtc *pKernelCRTC = drmModeGetCrtc( drm->fd, uCRTCId );
+		const bool bHasMode = !pKernelCRTC || pKernelCRTC->mode_valid;
+		drmModeFreeCrtc( pKernelCRTC );
+
+		if ( bHasMode )
+			continue;
+
+		drm_log.debugf( "Unlinking plane %u left on foreign CRTC %u", pPlane->GetObjectId(), uCRTCId );
+
+		bAnyForeign = true;
+		pPlane->GetProperties().FB_ID->SetPendingValue( req, 0, true );
+		pPlane->GetProperties().CRTC_ID->SetPendingValue( req, 0, true );
+	}
+
+	if ( bAnyForeign )
+	{
+		int ret = drmModeAtomicCommit( drm->fd, req, DRM_MODE_ATOMIC_ALLOW_MODESET, nullptr );
+		// -EACCES just means we're VT-switched away, our caller handles that.
+		if ( ret != 0 && ret != -EACCES )
+			drm_log.errorf_errno( "drm_unlink_foreign_planes: commit failed" );
+	}
+
+	drmModeAtomicFree( req );
+}
+
 /* Prepares an atomic commit for the provided scene-graph. Returns 0 on success,
  * negative errno on failure or if the scene-graph can't be presented directly. */
 int drm_prepare( struct drm_t *drm, bool async, const struct FrameInfo_t *frameInfo )
@@ -2944,9 +3234,6 @@ int drm_prepare( struct drm_t *drm, bool async, const struct FrameInfo_t *frameI
 		if ( bVRREnabled != !!drm->pCRTC->GetProperties().VRR_ENABLED->GetCurrentValue() )
 			drm->needs_modeset = true;
 	}
-
-	if (drm->pCRTC && drm->pCRTC->GetProperties().ACTIVE->GetCurrentValue() != !frameInfo->dpms)
-		drm->needs_modeset = true;
 
 	drm_colorspace uColorimetry = DRM_MODE_COLORIMETRY_DEFAULT;
 
@@ -2980,9 +3267,9 @@ int drm_prepare( struct drm_t *drm, bool async, const struct FrameInfo_t *frameI
 	assert( drm->req == nullptr );
 	drm->req = drmModeAtomicAlloc();
 
-	bool bSinglePlane = frameInfo->layerCount < 2 && cv_drm_single_plane_optimizations;
+	bool bSinglePlane = frameInfo->layers.count() < 2 && cv_drm_single_plane_optimizations;
 
-	if ( drm_supports_srgb_to_pq( &g_DRM ) && frameInfo->applyOutputColorMgmt )
+	if ( drm_supports_srgb_to_pq( drm ) && frameInfo->applyOutputColorMgmt )
 	{
 		if ( !cv_drm_debug_disable_output_tf && !bSinglePlane )
 		{
@@ -3007,16 +3294,13 @@ int drm_prepare( struct drm_t *drm, bool async, const struct FrameInfo_t *frameI
 	bool bSleep = false;
 	if ( drm->pConnector )
 	{
-		bSleep = cv_drm_sleep_screens[ drm->pConnector->GetScreenType() ];
+		bSleep = gamescope::DisplayShouldSleep( cv_drm_sleep_screens[ drm->pConnector->GetScreenType() ], frameInfo->dpms );
 
 		bool bCurrentlyAsleep = drm->pConnector->GetProperties().CRTC_ID->GetCurrentValue() == 0;
 
 		if ( bCurrentlyAsleep != bSleep )
 			needs_modeset = true;
 	}
-
-	if ( frameInfo->dpms )
-		bSleep = true;
 
 	if ( !bSleep )
 	{
@@ -3032,6 +3316,8 @@ int drm_prepare( struct drm_t *drm, bool async, const struct FrameInfo_t *frameI
 	if ( needs_modeset )
 	{
 		flags |= DRM_MODE_ATOMIC_ALLOW_MODESET;
+
+		drm_unlink_foreign_planes( drm );
 
 		// Disable all connectors and CRTCs
 
@@ -3097,13 +3383,7 @@ int drm_prepare( struct drm_t *drm, bool async, const struct FrameInfo_t *frameI
 
 		if ( drm->pCRTC && !bSleep )
 		{
-			if ( frameInfo->dpms ) {
-				// We can't disable a CRTC if it's already disabled
-				if (drm->pCRTC->GetProperties().ACTIVE->GetCurrentValue() != 0)
-					drm->pCRTC->GetProperties().ACTIVE->SetPendingValue(drm->req, 0, true);
-			}
-			else
-				drm->pCRTC->GetProperties().ACTIVE->SetPendingValue( drm->req, 1u, true );
+			drm->pCRTC->GetProperties().ACTIVE->SetPendingValue( drm->req, 1u, true );
 			drm->pCRTC->GetProperties().MODE_ID->SetPendingValue( drm->req, drm->pending.mode_id ? drm->pending.mode_id->GetBlobValue() : 0lu, true );
 
 			// Clear color properties inherited from a previous DRM master (i.e. KDE's
@@ -3307,24 +3587,67 @@ bool drm_update_color_mgmt(struct drm_t *drm)
 
 int g_nDynamicRefreshHz = 0;
 
-static void drm_unset_mode( struct drm_t *drm )
+static void drm_unset_mode( struct drm_t *drm, bool force )
 {
 	drm->pending.mode_id = 0;
 	drm->needs_modeset = true;
 
-	g_nOutputWidth = drm->preferred_width;
-	g_nOutputHeight = drm->preferred_height;
+	const bool bPreferredSize = drm->preferred_width != 0 || drm->preferred_height != 0;
+	const bool bPreferredRefresh = drm->preferred_refresh != 0;
+
+	// Forced on a cold start, a mode pick while headless and a session resume.
+	saved_mode mode_info{};
+	const bool bLastMode = ( !bPreferredSize || !bPreferredRefresh ) && force && get_last_display_mode( mode_info );
+
+	// An explicit -W/-H or -r wins for its part, else a display that went away mid-session keeps its mode.
+	if ( bPreferredSize )
+	{
+		g_nOutputWidth = drm->preferred_width;
+		g_nOutputHeight = drm->preferred_height;
+	}
+	else if ( bLastMode )
+	{
+		g_nOutputWidth = mode_info.width;
+		g_nOutputHeight = mode_info.height;
+	}
+
+	if ( bPreferredRefresh )
+		g_nOutputRefresh = drm->preferred_refresh;
+	else if ( bLastMode )
+		g_nOutputRefresh = gamescope::ConvertHztomHz( mode_info.refresh );
+
 	if (g_nOutputHeight == 0)
 		g_nOutputHeight = 720;
 	if (g_nOutputWidth == 0)
 		g_nOutputWidth = g_nOutputHeight * 16 / 9;
-
-	g_nOutputRefresh = drm->preferred_refresh;
 	if (g_nOutputRefresh == 0)
 		g_nOutputRefresh = gamescope::ConvertHztomHz( 60 );
 	g_nDynamicRefreshHz = 0;
 
 	g_bRotated = false;
+	g_uOutputRotation = 0;
+}
+
+// Bitmask of DRM_MODE_ROTATE_* the plane can do at scanout (just ROTATE_0 if it can't rotate).
+static uint64_t drm_plane_supported_rotations( struct drm_t *drm, gamescope::CDRMPlane *pPlane )
+{
+	if ( !pPlane->GetProperties().rotation )
+		return DRM_MODE_ROTATE_0;
+
+	drmModePropertyRes *pProp = drmModeGetProperty( drm->fd, pPlane->GetProperties().rotation->GetPropertyId() );
+	if ( !pProp )
+		return DRM_MODE_ROTATE_0;
+	defer( drmModeFreeProperty( pProp ) );
+
+	if ( !( pProp->flags & DRM_MODE_PROP_BITMASK ) )
+		return DRM_MODE_ROTATE_0;
+
+	uint64_t ulSupported = 0;
+	for ( int i = 0; i < pProp->count_enums; i++ )
+		if ( pProp->enums[i].value < 64 )
+			ulSupported |= 1ull << pProp->enums[i].value;
+
+	return ulSupported;
 }
 
 bool drm_set_mode( struct drm_t *drm, const drmModeModeInfo *mode )
@@ -3345,31 +3668,47 @@ bool drm_set_mode( struct drm_t *drm, const drmModeModeInfo *mode )
 
 	update_drm_effective_orientations(drm, mode);
 
+	// 90/270 transpose the output (g_bRotated); 180 flips in place.
+	uint32_t uStep = 0;
+	uint64_t ulNeeded = 0;
 	switch ( drm->pConnector->GetCurrentOrientation() )
 	{
 	default:
 	case GAMESCOPE_PANEL_ORIENTATION_0:
+		g_bRotated = false;
+		g_nOutputWidth = mode->hdisplay;
+		g_nOutputHeight = mode->vdisplay;
+		break;
 	case GAMESCOPE_PANEL_ORIENTATION_180:
 		g_bRotated = false;
 		g_nOutputWidth = mode->hdisplay;
 		g_nOutputHeight = mode->vdisplay;
-		
-		// When using rotation shader, adjust logical dimensions based on desired rotation
-		if (g_bEnableDRMRotationShader) {
-			if (g_eDRMRotationShaderOrientation == GAMESCOPE_PANEL_ORIENTATION_90 ||
-			    g_eDRMRotationShaderOrientation == GAMESCOPE_PANEL_ORIENTATION_270) {
-				// For 90/270 rotation, games see landscape (swapped dimensions)
-				g_bRotated = true;
-				std::swap(g_nOutputWidth, g_nOutputHeight);
-			}
-		}
+		uStep = 2u;
+		ulNeeded = DRM_MODE_ROTATE_180;
 		break;
 	case GAMESCOPE_PANEL_ORIENTATION_90:
+		g_bRotated = true;
+		g_nOutputWidth = mode->vdisplay;
+		g_nOutputHeight = mode->hdisplay;
+		uStep = 1u;
+		ulNeeded = DRM_MODE_ROTATE_90;
+		break;
 	case GAMESCOPE_PANEL_ORIENTATION_270:
 		g_bRotated = true;
 		g_nOutputWidth = mode->vdisplay;
 		g_nOutputHeight = mode->hdisplay;
+		uStep = 3u;
+		ulNeeded = DRM_MODE_ROTATE_270;
 		break;
+	}
+
+	// Rotate in the compositor when the scanout plane can't do the panel's orientation.
+	g_uOutputRotation = 0;
+	if ( uStep )
+	{
+		const bool bScanoutCanRotate = drm->pPrimaryPlane && ( drm_plane_supported_rotations( drm, drm->pPrimaryPlane ) & ulNeeded );
+		if ( g_bForceCompositionRotation || !bScanoutCanRotate )
+			g_uOutputRotation = uStep;
 	}
 
 	return true;
@@ -3497,20 +3836,23 @@ bool drm_supports_color_mgmt(struct drm_t *drm)
 	if ( !drm->pPrimaryPlane )
 		return false;
 
-	return drm->pPrimaryPlane->GetProperties().AMD_PLANE_CTM.has_value() &&         // dm->dc->caps.color.mpc.gamut_remap
-			drm->pPrimaryPlane->GetProperties().AMD_PLANE_SHAPER_LUT.has_value() && // dpp_color_caps.hw_3d_lut
-			drm->pPrimaryPlane->GetProperties().AMD_PLANE_DEGAMMA_TF.has_value();   // dpp_color_caps.dgam_ram || dpp_color_caps.gamma_corr
+	// Newer AMD hardware can provide LUT/CTM color management without a
+	// plane blend transfer function. Require each property used by that path.
+	const auto &props = drm->pPrimaryPlane->GetProperties();
+	return props.AMD_PLANE_CTM.has_value() &&
+		props.AMD_PLANE_SHAPER_LUT.has_value() &&
+		props.AMD_PLANE_SHAPER_TF.has_value() &&
+		props.AMD_PLANE_LUT3D.has_value() &&
+		props.AMD_PLANE_DEGAMMA_TF.has_value();
 }
 
 bool drm_supports_srgb_to_pq(struct drm_t *drm)
 {
-	if ( g_bForceDisableColorMgmt )
-		return false;
-
-	if ( !drm->pPrimaryPlane )
-		return false;
-
-	return drm->pPrimaryPlane->GetProperties().AMD_PLANE_BLEND_TF.has_value(); // dpp_color_caps.ogam_ram
+	// Mixed SDR/HDR planes also need linear-light blending and an output TF.
+	// A partial property set must fall back to composition instead.
+	return drm_supports_color_mgmt( drm ) &&
+		drm->pPrimaryPlane->GetProperties().AMD_PLANE_BLEND_TF.has_value() &&
+		drm->pCRTC && drm->pCRTC->GetProperties().AMD_CRTC_REGAMMA_TF.has_value();
 }
 
 std::span<const uint32_t> drm_get_valid_refresh_rates( struct drm_t *drm )
@@ -3558,7 +3900,10 @@ namespace gamescope
 		virtual bool PostInit() override
 		{
 			if ( g_DRM.pConnector )
+			{
 				WritePatchedEdid( g_DRM.pConnector->GetRawEDID(), g_DRM.pConnector->GetHDRInfo(), g_bRotated );
+				WriteModeListFile( g_DRM.pConnector->GetModes() );
+			}
 			return true;
 		}
 
@@ -3584,7 +3929,7 @@ namespace gamescope
         }
 		virtual bool ValidPhysicalDevice( VkPhysicalDevice pVkPhysicalDevice ) const override
 		{
-			return true;
+			return vulkan_has_drm_props();
 		}
 
 		virtual int Present( const FrameInfo_t *pFrameInfo, bool bAsync )
@@ -3594,67 +3939,77 @@ namespace gamescope
 			drm_log.debugf( "CDRMBackend::Present Begin: %lu -> delta: %lu", ulNow, ulNow - s_ulLastTime );
 			s_ulLastTime = ulNow;
 
-			bool bWantsPartialComposite = pFrameInfo->layerCount >= 3 && !kDisablePartialComposition;
+			bool bWantsPartialComposite = pFrameInfo->layers.count() >= 3 && !kDisablePartialComposition;
 
 			static bool s_bWasFirstFrame = true;
 			bool bWasFirstFrame = s_bWasFirstFrame;
 			s_bWasFirstFrame = false;
 
 			bool bDrewCursor = false;
-			for ( uint32_t i = 0; i < k_nMaxLayers; i++ )
+			for ( int i = 0; i < pFrameInfo->layers.count(); i++ )
 			{
-				if ( pFrameInfo->layers[i].zpos == g_zposCursor )
+				if ( pFrameInfo->layers.get( i ).zpos == g_zposCursor )
 				{
 					bDrewCursor = true;
 					break;
 				}
 			}
 
-			bool bLayer0ScreenSize = close_enough(pFrameInfo->layers[0].scale.x, 1.0f) && close_enough(pFrameInfo->layers[0].scale.y, 1.0f);
+			bool bLayer0ScreenSize = close_enough(pFrameInfo->layers.get( 0 ).scale.x, 1.0f) && close_enough(pFrameInfo->layers.get( 0 ).scale.y, 1.0f);
 
-			bool bNeedsCompositeFromFilter = (g_upscaleFilter == GamescopeUpscaleFilter::NEAREST || g_upscaleFilter == GamescopeUpscaleFilter::PIXEL) && !bLayer0ScreenSize;
+			GamescopeUpscaleFilter eLayer0Filter = pFrameInfo->layers.get( 0 ).filter;
+			bool bNeedsCompositeFromFilter = ( eLayer0Filter == GamescopeUpscaleFilter::NEAREST ||
+			                                   eLayer0Filter == GamescopeUpscaleFilter::PIXEL ) && !bLayer0ScreenSize;
 
 			bool bNeedsFullComposite = false;
 			bNeedsFullComposite |= cv_composite_force;
 			bNeedsFullComposite |= bWasFirstFrame;
 			bNeedsFullComposite |= pFrameInfo->useFSRLayer0;
 			bNeedsFullComposite |= pFrameInfo->useNISLayer0;
+			bNeedsFullComposite |= pFrameInfo->useSGSRLayer0;
 			bNeedsFullComposite |= pFrameInfo->blurLayer0;
 			bNeedsFullComposite |= bNeedsCompositeFromFilter;
-			bNeedsFullComposite |= !k_bUseCursorPlane && bDrewCursor;
+			bNeedsFullComposite |= !cv_drm_cursor_plane && bDrewCursor;
 			bNeedsFullComposite |= g_bColorSliderInUse;
 			bNeedsFullComposite |= pFrameInfo->bFadingOut;
 			bNeedsFullComposite |= !g_reshade_effect.empty();
 
-			if ( !SupportsColorManagement() ) {
-				// Fuzzy match default values to see if we need to composite
+			if ( !SupportsColorManagement() && g_ColorMgmt.pending.enabled )
+			{
+				// Keep persistent color adjustments active on Intel and other devices
+				// without the scanout LUT pipeline, even after a slider is released.
 				bNeedsFullComposite |= g_ColorMgmt.pending.nightmode.amount != 0.0f;
-				bNeedsFullComposite |= g_ColorMgmt.pending.outputVirtualWhite.x > 0 &&
-					abs(g_ColorMgmt.pending.outputVirtualWhite.x - 0.3127f) > 0.001f;
-				bNeedsFullComposite |= g_ColorMgmt.pending.outputVirtualWhite.y > 0 &&
-					abs(g_ColorMgmt.pending.outputVirtualWhite.y - 0.3290f) > 0.001f;
-				bNeedsFullComposite |= g_ColorMgmt.pending.sdrGamutWideness >= 0 &&
-					abs(g_ColorMgmt.pending.sdrGamutWideness - 0.5f) > 0.02f;
+				bNeedsFullComposite |= g_ColorMgmt.pending.outputVirtualWhite.x > 0.0f &&
+					std::abs( g_ColorMgmt.pending.outputVirtualWhite.x - 0.3127f ) > 0.001f;
+				bNeedsFullComposite |= g_ColorMgmt.pending.outputVirtualWhite.y > 0.0f &&
+					std::abs( g_ColorMgmt.pending.outputVirtualWhite.y - 0.3290f ) > 0.001f;
+				bNeedsFullComposite |= g_ColorMgmt.pending.sdrGamutWideness >= 0.0f &&
+					std::abs( g_ColorMgmt.pending.sdrGamutWideness - 0.5f ) > 0.02f;
 			}
 
 			if ( g_bOutputHDREnabled )
 			{
 				bNeedsFullComposite |= g_bHDRItmEnable;
 				if ( !SupportsSRGBtoPQ() )
-					bNeedsFullComposite |= ( pFrameInfo->layerCount > 1 || pFrameInfo->layers[0].colorspace != GAMESCOPE_APP_TEXTURE_COLORSPACE_HDR10_PQ );
+				{
+					bNeedsFullComposite |= pFrameInfo->layers.count() > 1 ||
+						pFrameInfo->layers.get( 0 ).colorspace != GAMESCOPE_APP_TEXTURE_COLORSPACE_HDR10_PQ ||
+						pFrameInfo->outputEncodingEOTF != EOTF_PQ;
+				}
+				if ( !SupportsColorManagement() )
+				{
+					// Scanout can't apply the LUT-baked backlight dim here.
+					bNeedsFullComposite |= g_ColorMgmt.current.flBacklightLutGain != 1.0f;
+				}
 			}
 			else
 			{
 				if ( !SupportsSRGBtoPQ() )
-					bNeedsFullComposite |= ColorspaceIsHDR( pFrameInfo->layers[0].colorspace );
+					bNeedsFullComposite |= ColorspaceIsHDR( pFrameInfo->layers.get( 0 ).colorspace );
 			}
 
 			bNeedsFullComposite |= !!(g_uCompositeDebug & CompositeDebugFlag::Heatmap);
-
-			if (g_bEnableDRMRotationShader)
-			{
-				bNeedsFullComposite = true;
-			}
+			bNeedsFullComposite |= g_uOutputRotation != 0; // can't rotate planes at scanout
 
 			bool bDoComposite = true;
 			if ( !bNeedsFullComposite && !bWantsPartialComposite )
@@ -3679,8 +4034,8 @@ namespace gamescope
 				// Scanout + Planes Path
 				m_bWasPartialCompositing = false;
 				m_bWasCompositing = false;
-				if ( pFrameInfo->layerCount == 2 )
-					m_nLastSingleOverlayZPos = pFrameInfo->layers[1].zpos;
+				if ( pFrameInfo->layers.count() == 2 )
+					m_nLastSingleOverlayZPos = pFrameInfo->layers.get( 1 ).zpos;
 
 				return Commit( pFrameInfo );
 			}
@@ -3691,7 +4046,7 @@ namespace gamescope
 
 			FrameInfo_t compositeFrameInfo = *pFrameInfo;
 
-			if ( compositeFrameInfo.layerCount == 1 )
+			if ( compositeFrameInfo.layers.count() == 1 )
 			{
 				// If we failed to flip a single plane then
 				// we definitely need to composite for some reason...
@@ -3702,7 +4057,7 @@ namespace gamescope
 			{
 				// If we want to partial composite, fallback to full
 				// composite if we have mismatching colorspaces in our overlays.
-				// This is 2, and we do i-1 so 1...layerCount. So AFTER we have removed baseplane.
+				// This is 2, and we do i-1 so 1...layers.count(). So AFTER we have removed baseplane.
 				// Overlays only.
 				//
 				// Josh:
@@ -3713,9 +4068,9 @@ namespace gamescope
 				// We can't just point it to random BDA or whatever, it has to be uploaded slowly
 				// thru registers which is SUPER SLOW.
 				// This avoids stutter.
-				for ( int i = 2; i < compositeFrameInfo.layerCount; i++ )
+				for ( int i = 2; i < compositeFrameInfo.layers.count(); i++ )
 				{
-					if ( pFrameInfo->layers[i - 1].colorspace != pFrameInfo->layers[i].colorspace )
+					if ( pFrameInfo->layers.get( i - 1 ).colorspace != pFrameInfo->layers.get( i ).colorspace )
 					{
 						bNeedsFullComposite = true;
 						break;
@@ -3734,9 +4089,9 @@ namespace gamescope
 			// from our frameinfo to composite.
 			if ( !bNeedsFullComposite )
 			{
-				for ( int i = 1; i < compositeFrameInfo.layerCount; i++ )
-					compositeFrameInfo.layers[i - 1] = compositeFrameInfo.layers[i];
-				compositeFrameInfo.layerCount -= 1;
+				for ( int i = 1; i < compositeFrameInfo.layers.count(); i++ )
+					compositeFrameInfo.layers.get( i - 1 ) = compositeFrameInfo.layers.get( i );
+				compositeFrameInfo.layers.pop();
 
 				// When doing partial composition, apply the shaper + 3D LUT stuff
 				// at scanout.
@@ -3751,7 +4106,7 @@ namespace gamescope
 			if ( bDefer && !!( g_uCompositeDebug & CompositeDebugFlag::Markers ) )
 				g_uCompositeDebug |= CompositeDebugFlag::Markers_Partial;
 
-			std::optional oCompositeResult = vulkan_composite( &compositeFrameInfo, nullptr, !bNeedsFullComposite, nullptr, true, nullptr, g_bEnableDRMRotationShader );
+			std::optional oCompositeResult = vulkan_composite( &compositeFrameInfo, nullptr, !bNeedsFullComposite );
 
 			m_bWasCompositing = true;
 
@@ -3773,9 +4128,8 @@ namespace gamescope
 			if ( bNeedsFullComposite )
 			{
 				presentCompFrameInfo.applyOutputColorMgmt = false;
-				presentCompFrameInfo.layerCount = 1;
-
-				FrameInfo_t::Layer_t *baseLayer = &presentCompFrameInfo.layers[ 0 ];
+				FrameInfo_t::Layer_t *baseLayer = presentCompFrameInfo.layers.push();
+				assert( baseLayer );
 				baseLayer->scale.x = 1.0;
 				baseLayer->scale.y = 1.0;
 				baseLayer->opacity = 1.0;
@@ -3795,12 +4149,13 @@ namespace gamescope
 				if ( m_bWasPartialCompositing || !bDefer )
 				{
 					presentCompFrameInfo.applyOutputColorMgmt = g_ColorMgmt.pending.enabled;
-					presentCompFrameInfo.layerCount = 2;
+					FrameInfo_t::Layer_t *baseLayer = presentCompFrameInfo.layers.push();
+					assert( baseLayer );
+					*baseLayer = pFrameInfo->layers.get( 0 );
+					baseLayer->zpos = g_zposBase;
 
-					presentCompFrameInfo.layers[ 0 ] = pFrameInfo->layers[ 0 ];
-					presentCompFrameInfo.layers[ 0 ].zpos = g_zposBase;
-
-					FrameInfo_t::Layer_t *overlayLayer = &presentCompFrameInfo.layers[ 1 ];
+					FrameInfo_t::Layer_t *overlayLayer = presentCompFrameInfo.layers.push();
+					assert( overlayLayer );
 					overlayLayer->scale.x = 1.0;
 					overlayLayer->scale.y = 1.0;
 					overlayLayer->opacity = 1.0;
@@ -3813,35 +4168,34 @@ namespace gamescope
 					// Partial composition stuff has the same colorspace.
 					// So read that from the composite frame info
 					overlayLayer->ctm = nullptr;
-					overlayLayer->colorspace = compositeFrameInfo.layers[0].colorspace;
+					overlayLayer->colorspace = compositeFrameInfo.layers.get( 0 ).colorspace;
 				}
 				else
 				{
 					// Use whatever overlay we had last while waiting for the
 					// partial composition to have anything queued.
 					presentCompFrameInfo.applyOutputColorMgmt = g_ColorMgmt.pending.enabled;
-					presentCompFrameInfo.layerCount = 1;
-
-					presentCompFrameInfo.layers[ 0 ] = pFrameInfo->layers[ 0 ];
-					presentCompFrameInfo.layers[ 0 ].zpos = g_zposBase;
+					FrameInfo_t::Layer_t *baseLayer = presentCompFrameInfo.layers.push();
+					assert( baseLayer );
+					*baseLayer = pFrameInfo->layers.get( 0 );
+					baseLayer->zpos = g_zposBase;
 
 					const FrameInfo_t::Layer_t *lastPresentedOverlayLayer = nullptr;
-					for (int i = 0; i < pFrameInfo->layerCount; i++)
+					for (int i = 0; i < pFrameInfo->layers.count(); i++)
 					{
-						if ( pFrameInfo->layers[i].zpos == m_nLastSingleOverlayZPos )
+						if ( pFrameInfo->layers.get( i ).zpos == m_nLastSingleOverlayZPos )
 						{
-							lastPresentedOverlayLayer = &pFrameInfo->layers[i];
+							lastPresentedOverlayLayer = &pFrameInfo->layers.get( i );
 							break;
 						}
 					}
 
 					if ( lastPresentedOverlayLayer )
 					{
-						FrameInfo_t::Layer_t *overlayLayer = &presentCompFrameInfo.layers[ 1 ];
+						FrameInfo_t::Layer_t *overlayLayer = presentCompFrameInfo.layers.push();
+						assert( overlayLayer );
 						*overlayLayer = *lastPresentedOverlayLayer;
 						overlayLayer->zpos = g_zposOverlay;
-
-						presentCompFrameInfo.layerCount = 2;
 					}
 				}
 
@@ -3947,13 +4301,16 @@ namespace gamescope
 
 		virtual IBackendConnector *GetCurrentConnector() override
 		{
-			return g_DRM.pConnector;
+			if ( g_DRM.pConnector )
+				return g_DRM.pConnector;
+
+			return &s_HeadlessConnector;
 		}
 
 		virtual IBackendConnector *GetConnector( GamescopeScreenType eScreenType ) override
 		{
-			if ( GetCurrentConnector() && GetCurrentConnector()->GetScreenType() == eScreenType )
-				return GetCurrentConnector();
+			if ( g_DRM.pConnector && g_DRM.pConnector->GetScreenType() == eScreenType )
+				return g_DRM.pConnector;
 
 			if ( eScreenType == GAMESCOPE_SCREEN_TYPE_INTERNAL )
 			{
@@ -4019,7 +4376,7 @@ namespace gamescope
 
 		virtual glm::uvec2 CursorSurfaceSize( glm::uvec2 uvecSize ) const override
 		{
-			if ( !k_bUseCursorPlane )
+			if ( !cv_drm_cursor_plane )
 				return uvecSize;
 
 			return glm::uvec2{ g_DRM.cursor_width, g_DRM.cursor_height };
@@ -4032,10 +4389,11 @@ namespace gamescope
 
 		virtual void HackUpdatePatchedEdid() override
 		{
-			if ( !GetCurrentConnector() )
+			if ( !g_DRM.pConnector )
 				return;
 
-			WritePatchedEdid( GetCurrentConnector()->GetRawEDID(), GetCurrentConnector()->GetHDRInfo(), g_bRotated );
+			WritePatchedEdid( g_DRM.pConnector->GetRawEDID(), g_DRM.pConnector->GetHDRInfo(), g_bRotated );
+			WriteModeListFile( g_DRM.pConnector->GetModes() );
 		}
 
 	protected:
@@ -4088,14 +4446,14 @@ namespace gamescope
 				drm->m_QueuedFbIds.swap( drm->m_FbIdsInRequest );
 			}
 
-			GetCurrentConnector()->PresentationFeedback().m_uQueuedPresents++;
+			g_DRM.pConnector->PresentationFeedback().m_uQueuedPresents++;
 
 			uint32_t uCurrentPresentCtx = m_uNextPresentCtx;
 			m_uNextPresentCtx = ( m_uNextPresentCtx + 1 ) % 3;
-			m_PresentCtxs[uCurrentPresentCtx].ulPendingFlipCount = GetCurrentConnector()->PresentationFeedback().m_uQueuedPresents;
+			m_PresentCtxs[uCurrentPresentCtx].ulPendingFlipCount = g_DRM.pConnector->PresentationFeedback().m_uQueuedPresents;
 
-			drm_log.debugf("flip commit %" PRIu64, (uint64_t)GetCurrentConnector()->PresentationFeedback().m_uQueuedPresents);
-			gpuvis_trace_printf( "flip commit %" PRIu64, (uint64_t)GetCurrentConnector()->PresentationFeedback().m_uQueuedPresents );
+			drm_log.debugf("flip commit %" PRIu64, (uint64_t)g_DRM.pConnector->PresentationFeedback().m_uQueuedPresents);
+			gpuvis_trace_printf( "flip commit %" PRIu64, (uint64_t)g_DRM.pConnector->PresentationFeedback().m_uQueuedPresents );
 
 			ret = drmModeAtomicCommit(drm->fd, drm->req, drm->flags, &m_PresentCtxs[uCurrentPresentCtx] );
 			if ( ret != 0 )
@@ -4121,7 +4479,7 @@ namespace gamescope
 				// Clear our refs.
 				drm->m_FbIdsInRequest.clear();
 
-				GetCurrentConnector()->PresentationFeedback().m_uQueuedPresents--;
+				g_DRM.pConnector->PresentationFeedback().m_uQueuedPresents--;
 
 				if ( isPageFlip )
 					drm->uPendingFlipCount--;
@@ -4197,4 +4555,3 @@ int HackyDRMPresent( const FrameInfo_t *pFrameInfo, bool bAsync )
 {
 	return static_cast<gamescope::CDRMBackend *>( GetBackend() )->Present( pFrameInfo, bAsync );
 }
-

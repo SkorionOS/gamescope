@@ -2,16 +2,16 @@ project(
   'gamescope',
   'c',
   'cpp',
-  meson_version: '>=0.58.0',
+  meson_version: '>=0.60.0',
   default_options: [
     'cpp_std=c++20',
     'warning_level=2',
-    'force_fallback_for=wlroots,libliftoff,vkroots',
+    'force_fallback_for=libliftoff,vkroots',
   ],
 )
 
 fallbacks = get_option('force_fallback_for')
-if not (fallbacks.contains('wlroots') and fallbacks.contains('libliftoff') and fallbacks.contains('vkroots'))
+if not (fallbacks.contains('libliftoff') and fallbacks.contains('vkroots'))
   error('!!!"force_fallback_for" is missing entries!!!\n\tPlease do not remove entries from force_fallback_for if you are packaging the project.\n\tWe pull in these projects at specific commits/forks/builds for a reason.\n\tIf you are not packaging, remove this line to continue.')
 endif
 
@@ -35,6 +35,7 @@ add_project_arguments(cppc.get_supported_arguments([
   '-Wno-deprecated-volatile',
   '-Wno-ignored-qualifiers', # reshade warning
   '-Wno-missing-braces',
+  '-fno-cxx-modules', # reshade error due to a struct named module
 ]), language: 'cpp')
 
 add_project_arguments(cppc.get_supported_arguments([
@@ -60,10 +61,7 @@ if get_option('enable_openvr_support')
   if not openvr_dep.found()
     cmake = import('cmake')
     openvr_var = cmake.subproject_options()
-    openvr_var.add_cmake_defines({'USE_LIBCXX': false,
-    #HACK: remove me when openvr supports CMake 4.0
-    'CMAKE_POLICY_VERSION_MINIMUM': '3.5'})
-    #ENDHACK
+    openvr_var.add_cmake_defines({'USE_LIBCXX': false})
     openvr_var.set_override_option('warning_level', '0')
     openvr_proj = cmake.subproject('openvr', options : openvr_var)
     openvr_dep = openvr_proj.dependency('openvr_api')
@@ -97,6 +95,14 @@ endif
 
 subdir('protocol')
 
+if not get_option('enable_zenity')
+  add_project_arguments(
+    '-DDISABLE_ZENITY',
+    language: 'cpp',
+  )
+endif
+
+
 if get_option('enable_gamescope_wsi_layer')
   subdir('layer')
 endif
@@ -104,6 +110,11 @@ endif
 if get_option('enable_gamescope')
   subdir('src')
 endif
+
+if get_option('enable_tests') and get_option('enable_gamescope')
+  subdir('tests')
+endif
+
 
 # Handle default script/config/looks stuff
 meson.add_install_script('default_extras_install.sh')

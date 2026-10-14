@@ -2,18 +2,12 @@
 
 #include <span>
 #include <string>
-#include <string_view>
-#include <unordered_map>
-#include <utility>
-#include <optional>
-#include <charconv>
 #include <type_traits>
-#include <cstdint>
 #include <functional>
-#include <cassert>
 
-#include "Script/Script.h"
 #include "Utils/Dict.h"
+#include "Utils/Parsers.h"
+#include "Utils/String.h"
 
 #include "log.hpp"
 
@@ -41,56 +35,14 @@ namespace gamescope
         return std::string( svThing );
     }
 
-    template <typename T>
-    inline std::optional<T> Parse( std::string_view chars )
-    {
-        T obj;
-        auto result = std::from_chars( chars.begin(), chars.end(), obj );
-        if ( result.ec == std::errc{} )
-            return obj;
-        else
-            return std::nullopt;
-    }
-
-    template <>
-    inline std::optional<bool> Parse( std::string_view chars )
-    {
-        std::optional<uint32_t> oNumber = Parse<uint32_t>( chars );
-        if ( oNumber )
-            return !!*oNumber;
-
-        if ( chars == "true" )
-            return true;
-        else
-            return false;
-    }
-
-    inline void Split( std::vector<std::string_view> &tokens, std::string_view string, std::string_view delims = " " )
-    {
-        size_t end = 0;
-        for ( size_t start = 0; start < string.size() && end != std::string_view::npos; start = end + 1 )
-        {
-            end = string.find_first_of( delims, start );
-
-            if ( start != end )
-                tokens.emplace_back( string.substr( start, end-start ) );
-        }
-    }
-
-    inline std::vector<std::string_view> Split( std::string_view string, std::string_view delims = " " )
-    {
-        std::vector<std::string_view> tokens;
-        Split( tokens, string, delims );
-        return tokens;
-    }
+    namespace detail { struct ConVarScriptRegistrar; }
 
     class ConCommand
     {
+        friend struct detail::ConVarScriptRegistrar;
         using ConCommandFunc = std::function<void( std::span<std::string_view> )>;
 
     public:
-        DECLARE_SCRIPTDESC( ConCommand );
-
         ConCommand( std::string_view pszName, std::string_view pszDescription, ConCommandFunc func, bool bRegisterScript = true );
         ~ConCommand();
 
@@ -116,25 +68,22 @@ namespace gamescope
         std::string_view GetDescription() const { return m_pszDescription; }
 
         static Dict<ConCommand *>& GetCommands();
+#if HAVE_SCRIPTING
+        static void RegisterScript( std::string_view name, ConCommand *cmd );
+#endif
     protected:
         std::string_view m_pszName;
         std::string_view m_pszDescription;
         ConCommandFunc m_Func;
     };
 
-    START_SCRIPTDESC( ConCommand, "concommand" )
-        SCRIPTDESC( "name", &ConCommand::m_pszName )
-        SCRIPTDESC( "description", &ConCommand::m_pszDescription )
-        SCRIPTDESC( "call", &ConCommand::CallWithArgString )
-    END_SCRIPTDESC()
 
     template <typename T>
     class ConVar : public ConCommand
     {
+        friend struct detail::ConVarScriptRegistrar;
         using ConVarCallbackFunc = std::function<void(ConVar<T> &)>;
     public:
-        DECLARE_SCRIPTDESC( ConVar<T> );
-
         ConVar( std::string_view pszName, T defaultValue = T{}, std::string_view pszDescription = "", ConVarCallbackFunc func = nullptr, bool bRunCallbackAtStartup = false, bool bRegisterScript = true )
             : ConCommand( pszName, pszDescription, [this]( std::span<std::string_view> pArgs ){ this->InvokeFunc( pArgs ); }, false )
             , m_Value{ defaultValue }
@@ -147,11 +96,13 @@ namespace gamescope
 
 #if HAVE_SCRIPTING
             if ( bRegisterScript )
-            {
-                CScriptScopedLock().Manager().Gamescope().Convars.Base[pszName] = this;
-            }
+                RegisterScript( pszName, this );
 #endif
         }
+
+#if HAVE_SCRIPTING
+        static void RegisterScript( std::string_view name, ConVar<T> *cv );
+#endif
 
         const T& Get() const
         {
@@ -237,13 +188,5 @@ namespace gamescope
         bool m_bInCallback;
     };
 
-    SCRIPTDESC_TEMPLATE( T )
-    START_SCRIPTDESC_ANON( ConVar<T> )
-        SCRIPTDESC( "name", &ConVar<T>::m_pszName )
-        SCRIPTDESC( "description", &ConVar<T>::m_pszDescription )
-        SCRIPTDESC( "call", &ConVar<T>::CallWithArgString )
-
-        SCRIPTDESC( "value", &ConVar<T>::m_Value )
-    END_SCRIPTDESC()
 
 }

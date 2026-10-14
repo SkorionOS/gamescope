@@ -114,8 +114,13 @@ struct steamcompmgr_win_t {
 	bool isSteamStreamingClientVideo = false;
 	uint32_t inputFocusMode = 0;
 	uint32_t appID = 0;
+	uint32_t steamAppID = 0;
 	bool isOverlay = false;
 	bool isExternalOverlay = false;
+	// mangoapp keeps the property but zeroes it while hidden.
+	bool bHasExternalOverlayProp = false;
+	// Set by per-connector mangoapp instances.
+	uint32_t uMangoappMsgType = 0;
 
 	bool bIsSteamPid = false;
 	bool bIsSteamWebHelperPid = false;
@@ -149,9 +154,8 @@ struct steamcompmgr_win_t {
 	uint32_t hwndStyleEx = 0;
 
 	bool bHasHadNonSRGBColorSpace = false;
-	bool bHasHDRColorspace = false;
 
-	bool nudged = false;
+	bool placed = false;
 	bool ignoreOverrideRedirect = false;
 
 	bool unlockedForFrameCallback = false;
@@ -185,6 +189,14 @@ struct steamcompmgr_win_t {
 			return &g_steamcompmgr_xdg_focus;
 		else
 			return nullptr;
+	}
+
+	void Raise() const
+	{
+		if (type != steamcompmgr_win_type_t::XWAYLAND)
+			return;
+
+		XRaiseWindow(xwayland().ctx->dpy, xwayland().id);
 	}
 
 	Rect GetGeometry() const
@@ -231,6 +243,14 @@ struct steamcompmgr_win_t {
 			return xwayland().surface.override_surface;
 		else
 			return nullptr;
+	}
+
+	const char *debug_name() const
+	{
+		if ( title )
+			return title->c_str();
+
+		return pid_name.c_str();
 	}
 
 	gamescope::VirtualConnectorKey_t GetVirtualConnectorKey( gamescope::VirtualConnectorStrategy eStrategy )

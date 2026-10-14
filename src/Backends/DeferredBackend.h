@@ -182,6 +182,17 @@ namespace gamescope
 
             return nullptr;
 		}
+		virtual IBackendConnector *GetCurrentMouseConnector() override
+		{
+            {
+                std::shared_lock lock{ m_mutInit };
+                if ( m_bInittedChild )
+                    return m_pChild->GetCurrentMouseConnector();
+            }
+
+            return nullptr;
+		}
+
 		virtual IBackendConnector *GetConnector( GamescopeScreenType eScreenType ) override
 		{
             {
@@ -353,11 +364,6 @@ namespace gamescope
         bool NewlyInitted() override
         {
             return m_bJustInittedClient.exchange( false );
-        }
-
-        bool ShouldFitWindows() override
-        {
-            return m_pChild->ShouldFitWindows();
         }
 
         void OnEndFrame() override

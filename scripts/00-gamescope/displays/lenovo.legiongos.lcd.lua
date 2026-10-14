@@ -10,7 +10,7 @@ gamescope.config.known_displays.legiongos_lcd = {
         max_frame_average_luminance = 500,
         min_content_light_level = 0.5
     },
-    
+
     dynamic_refresh_rates = {
         48, 49, 50, 51, 52, 53, 54, 55, 56, 57,
         58, 59, 60, 61, 62, 63, 64, 65, 66, 67,
@@ -21,7 +21,7 @@ gamescope.config.known_displays.legiongos_lcd = {
         108, 109, 110, 111, 112, 113, 114, 115, 116, 117,
         118, 119, 120
     },
-    
+
     -- Detailed Timing Descriptors:
     -- DTD 1:  1920x1200  120.002 Hz   8:5   151.683 kHz 315.500 MHz (172 mm x 107 mm)
     --   Modeline "1920x1200_120.00" 315.500  1920 1968 2000 2080  1200 1254 1260 1264  -HSync -VSync
@@ -52,7 +52,7 @@ gamescope.config.known_displays.legiongos_lcd = {
         return mode
     end,
 
-    
+
     matches = function(display)
         local lcd_types = {
             { vendor = "CSW", model = "PN8007QB1-1", product = 0x0800 },
